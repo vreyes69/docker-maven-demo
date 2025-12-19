@@ -101,3 +101,141 @@
     </executions>
 </plugin>
 ```
+
+# 配置docker tls
+
+## Step 1：准备目录
+
+```
+mkdir -p /etc/docker/certs
+cd /etc/docker/certs
+```
+
+------
+
+## Step 2：生成 CA
+
+```
+openssl genrsa -aes256 -out ca-key.pem 4096
+openssl req -new -x509 -days 3650 \
+  -key ca-key.pem -sha256 -out ca.pem
+```
+
+✔ 只做一次
+
+------
+
+## Step 3：生成 Server 证书（重点）
+
+```
+openssl genrsa -out server-key.pem 4096
+
+openssl req -subj "/CN=192.168.10.20" \
+  -new -key server-key.pem -out server.csr
+```
+
+### SAN（非常重要）
+
+```
+cat > extfile.cnf <<EOF
+subjectAltName = IP:192.168.10.20,IP:127.0.0.1
+extendedKeyUsage = serverAuth
+EOF
+openssl x509 -req -days 3650 -sha256 \
+  -in server.csr \
+  -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
+  -out server-cert.pem -extfile extfile.cnf
+```
+
+------
+
+## Step 4：生成 Client 证书
+
+```
+openssl genrsa -out client-key.pem 4096
+
+openssl req -subj "/CN=docker-client" \
+  -new -key client-key.pem -out client.csr
+echo extendedKeyUsage = clientAuth > extfile-client.cnf
+openssl x509 -req -days 3650 -sha256 \
+  -in client.csr \
+  -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
+  -out client-cert.pem -extfile extfile-client.cnf
+```
+
+------
+
+## Step 5：权限整理
+
+```
+chmod 0400 ca-key.pem server-key.pem
+chmod 0444 ca.pem server-cert.pem
+```
+
+客户端用的证书 **稍后拷贝，不留私钥在服务器**
+
+------
+
+## Step 6：配置 Docker（systemd 正确方式）
+
+### 创建 override 文件
+
+```
+mkdir -p /etc/systemd/system/docker.service.d
+vim /etc/systemd/system/docker.service.d/override.conf
+```
+
+内容：
+
+```
+[Service]
+ExecStart=
+ExecStart=/usr/bin/dockerd \
+  --tlsverify \
+  --tlscacert=/etc/docker/certs/ca.pem \
+  --tlscert=/etc/docker/certs/server-cert.pem \
+  --tlskey=/etc/docker/certs/server-key.pem \
+  -H unix:///var/run/docker.sock \
+  -H tcp://192.168.5.24:12581
+```
+
+------
+
+## Step 7：重载并重启
+
+```
+systemctl daemon-reload
+systemctl restart docker
+```
+
+确认：
+
+```
+systemctl status docker
+```
+
+------
+
+## Step 8：拷贝客户端证书（只拷 3 个）
+
+```
+scp /etc/docker/certs/ca.pem user@client:/opt/docker/certs/
+scp /etc/docker/certs/client-cert.pem user@client:/opt/docker/certs/
+scp /etc/docker/certs/client-key.pem user@client:/opt/docker/certs/
+```
+
+（你也可以在生成后直接放到安全位置）
+
+------
+
+## Step 9：本地验证 Docker TLS
+
+```
+docker \
+  --tlsverify \
+  --tlscacert=ca.pem \
+  --tlscert=client-cert.pem \
+  --tlskey=client-key.pem \
+  -H tcp://192.168.10.20:2376 info
+```
+如果看到 Docker 信息，说明配置成功。
